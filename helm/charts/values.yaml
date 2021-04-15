@@ -1,0 +1,62 @@
+# Default values for ep-data-dataflow.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+replicaCount: 1
+#This parameter is used to replace projectId referenced in any of the values.
+projectId: "eplus-cbs-bld-02-fb4a"
+image:
+  repository: eu.gcr.io/projectId/eplus-product-df
+  tag: v0.1.0
+  pullPolicy: Always
+#  pullSecret: "gcr-json-key"
+purgeJob: 300
+nameOverride: ""
+fullnameOverride: eplus-product-df
+namespace: dataflow
+resources:
+  limits:
+    cpu: 800m
+    memory: 2Gi
+  requests:
+    cpu: 200m
+    memory: 200Mi
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+serviceAccount:
+  name: sa-cbs-dataflow-deployer
+  automountServiceAccountToken: false
+  annotation: svc-cbs-dataflow-deployer@projectId.iam.gserviceaccount.com
+
+arguments:
+  - "--runner=DataflowRunner"
+  - "--project=projectId"
+  - "--tempLocation=gs://dfl-eplus-cbs-bld-02-fb4a/temp"
+  - "--gcpTempLocation=gs://dfl-eplus-cbs-bld-02-fb4a/templates/kafka-df-spanner.json"
+  - "--stagingLocation=gs://dfl-eplus-cbs-bld-02-fb4a/staging"
+  - "--region=europe-west1"
+  - "--zone=europe-west2-a"
+  - "--jobName=eplus-cbs-bld-02-dfl-euwe2-product-update"
+  - "--subnetwork=https://www.googleapis.com/compute/v1/projects/eplus-hst-bld-02-8e0b/regions/europe-west2/subnetworks/cbs-csn-euwe2-dfl-01"
+  - "--usePublicIps=false"
+  - "--serviceAccount=svc-cbs-dataflow-job@eplus-cbs-bld-02-fb4a.iam.gserviceaccount.com"
+  - "--bootstrapServers=kafka-01.eplus-bld-02.oncp.dev:9092"
+  - "--inputTopics=vault.products_api.v1.product_catalogue.product.events"
+  - "--spannerProjectId=eplus-dat-bld-02-b5cc"
+  - "--instanceId=eplus-build-spanner"
+  - "--databaseId=accounts"
+  - "--pubSubProjectId=eplus-dat-bld-02-b5cc"
+  - "--entPubSubCreateProductTopic=eplus_enterprise_vault_core_api_v1_products_product_create_events"
+  - "--entPubSubUpdateProductTopic=eplus_enterprise_vault_core_api_v1_products_product_update_events"
+  - "--max-workers=1"
+
+dafaflowLifeCycle:
+  name: "utility"
+  action: "drain"
+  image: eu.gcr.io/eplus-mfa-bld-02-1727/dat/gcloud-dataflow-lifecycle:v0.26.0
+  region: "europe-west1"
+  jobName: "eplus-cbs-bld-02-dfl-euwe2-account-create"
+  command: "cancel"
+  waitTimeInSeconds: "10"
