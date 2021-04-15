@@ -1,0 +1,500 @@
+package com.lbg.epscw.product.pipeline;
+
+import com.google.auth.oauth2.GoogleCredentials;
+import com.google.cloud.ReadChannel;
+import com.google.cloud.spanner.Mutation;
+import com.google.cloud.storage.Blob;
+import com.google.cloud.storage.Storage;
+import com.google.cloud.storage.StorageOptions;
+import com.lbg.epscw.product.coders.FailsafeElementCoder;
+import com.lbg.epscw.product.constants.CommonConstants;
+import com.lbg.epscw.product.model.ProductVersion;
+import com.lbg.epscw.product.model.ProductsCatalogue;
+import com.lbg.epscw.product.transform.mutation.MultiRowToMutationTransform;
+import com.lbg.epscw.product.transform.mutation.SingleRowToMutationTransform;
+import com.lbg.epscw.product.util.FailsafeElement;
+import org.apache.beam.runners.dataflow.options.DataflowPipelineOptions;
+import org.apache.beam.sdk.Pipeline;
+import org.apache.beam.sdk.PipelineResult;
+import org.apache.beam.sdk.coders.*;
+import org.apache.beam.sdk.io.gcp.spanner.SpannerIO;
+import org.apache.beam.sdk.io.kafka.KafkaIO;
+import org.apache.beam.sdk.options.Description;
+import org.apache.beam.sdk.options.PipelineOptions;
+import org.apache.beam.sdk.options.Validation;
+import org.apache.beam.sdk.options.ValueProvider;
+import org.apache.beam.sdk.transforms.PTransform;
+import org.apache.beam.sdk.transforms.SerializableFunction;
+import org.apache.beam.sdk.values.KV;
+import org.apache.beam.sdk.values.PCollection;
+import org.apache.beam.sdk.values.PCollectionTuple;
+import org.apache.beam.sdk.values.TupleTag;
+import org.apache.kafka.clients.consumer.Consumer;
+import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.clients.consumer.KafkaConsumer;
+import org.apache.kafka.common.config.SslConfigs;
+import org.apache.kafka.common.serialization.ByteArrayDeserializer;
+import org.apache.kafka.common.serialization.StringDeserializer;
+import org.joda.time.Instant;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.util.ObjectUtils;
+
+import java.io.File;
+import java.io.FileNotFoundException;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * It is an abstract Java class which is used to provide common method implementation to all the pipelines.
+ */
+public abstract class AbstractKafkaToSinkPipeline {
+
+    public static final Logger LOG = LoggerFactory.getLogger(AbstractKafkaToSinkPipeline.class);
+
+    private static final String TRANSFORM_MAP_TO_MUTATION = "TransformMapToMutation";
+
+    private static final String SPANNER_WRITE_OPERATION_FAILED =
+            "Write operation to Spanner failed";
+
+    public static final TupleTag<Mutation> SUCCESS_MAP_TO_MUTATION = new TupleTag<Mutation>() {
+    };
+
+    public static final TupleTag<FailsafeElement<KV<String, String>, String>>
+            KAFKA_TO_PROTO_FAILURE_TAG = new TupleTag<FailsafeElement<KV<String, String>, String>>() {
+    };
+
+    public static final TupleTag<Map<String, String>> PROTO_TO_MAP_SUCCESS_TAG =
+            new TupleTag<Map<String, String>>() {
+            };
+
+    public static final TupleTag<FailsafeElement<Map<String, String>, Map<String, String>>>
+            FAILURE_MAP_TO_SINK =
+            new TupleTag<FailsafeElement<Map<String, String>, Map<String, String>>>() {
+            };
+
+    public static final TupleTag<List<Map<String, String>>> PROTO_TO_MAP_LIST_SUCCESS_TAG =
+            new TupleTag<List<Map<String, String>>>() {
+            };
+
+    /**
+     * This method creates and runs the pipeline based on the options provided.
+     *
+     * @param options The options required to run pipeline.
+     * @return PipelineResult
+     */
+    public PipelineResult run(CustomPipelineOptions options) {
+
+        Pipeline pipeline = Pipeline.create(options);
+
+        registerCoder(pipeline);
+
+        LOG.info("Creating pipeline");
+
+        LOG.info("Coder registration completed");
+
+        PCollection<KV<String, String>> kafkaMessages = readKafkaMessages(pipeline, options);
+
+        LOG.info("Received kafka message, initiating transformations");
+
+        initiateTransformations(kafkaMessages, options);
+
+        LOG.info("Executing pipeline using the DirectRunner.");
+
+        return pipeline.run();
+    }
+
+    /**
+     * This is an abstract method which is called from each individual pipeline classes
+     * to perform some transformations on the kafka messages received.
+     *
+     * @param kafkaMessages The kafka messages in key-value form.
+     * @param options       The options required to run pipeline.
+     */
+    public abstract void initiateTransformations(PCollection<KV<String, String>> kafkaMessages,
+                                                 CustomPipelineOptions options);
+
+    /**
+     * This method serializes the state of an object into a byte stream using CoderRegistry.
+     * CoderRegistry is used to create a Coder for this Java class.
+     * A Coder<T> is used to define how to encode and decode values of type T into byte streams.
+     *
+     * @param pipeline The dataflow pipeline.
+     */
+    public void registerCoder(Pipeline pipeline) {
+        CoderRegistry coderRegistry = pipeline.getCoderRegistry();
+
+        FailsafeElementCoder<KV<String, String>, String> coderKafka = FailsafeElementCoder
+                .of(KvCoder.of(StringUtf8Coder.of(), StringUtf8Coder.of()), StringUtf8Coder.of());
+
+        coderRegistry.registerCoderForType(coderKafka.getEncodedTypeDescriptor(), coderKafka);
+
+        FailsafeElementCoder<Map<String, String>, Map<String, String>> coderMap =
+                FailsafeElementCoder.of(MapCoder.of(StringUtf8Coder.of(), StringUtf8Coder.of()),
+                        MapCoder.of(StringUtf8Coder.of(), StringUtf8Coder.of()));
+
+        coderRegistry.registerCoderForType(coderMap.getEncodedTypeDescriptor(), coderMap);
+
+        FailsafeElementCoder<ProductsCatalogue, ProductsCatalogue> accountBuilderCoder =
+                FailsafeElementCoder.of(SerializableCoder.of(ProductsCatalogue.class),
+                        SerializableCoder.of(ProductsCatalogue.class));
+
+        coderRegistry.registerCoderForType(accountBuilderCoder.getEncodedTypeDescriptor(),
+                accountBuilderCoder);
+
+        FailsafeElementCoder<ProductVersion, ProductVersion> productVersionCoder =
+                FailsafeElementCoder.of(SerializableCoder.of(ProductVersion.class),
+                        SerializableCoder.of(ProductVersion.class));
+
+        coderRegistry.registerCoderForType(productVersionCoder.getEncodedTypeDescriptor(),
+                productVersionCoder);
+    }
+
+    /**
+     * This method parses kafka message to Proto object by using the corresponding PTransform given as a parameter.
+     *
+     * @param stepName           The name of the Transformation step.
+     * @param kafkaMessages      The kafka messages in key-value form.
+     * @param messageTransformer The PTransform to convert kafka messages to Proto Object.
+     * @return PCollectionTuple
+     */
+    public PCollectionTuple parseMsgToProto(String stepName,
+                                            PCollection<KV<String, String>> kafkaMessages,
+                                            PTransform<PCollection<KV<String, String>>, PCollectionTuple> messageTransformer) {
+        return kafkaMessages.apply(stepName, messageTransformer);
+    }
+
+    /**
+     * This method reads kafka messages from the pipeline passed as a parameter.
+     *
+     * @param pipeline The dataflow pipeline.
+     * @param options  The options required to run pipeline.
+     * @return PCollection of key-value Kafka messages.
+     */
+    public PCollection<KV<String, String>> readKafkaMessages(Pipeline pipeline,
+                                                             CustomPipelineOptions options) {
+        Map<String, Object> consumerConfig = new HashMap<>();
+        consumerConfig.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, true);
+        consumerConfig.put(ConsumerConfig.GROUP_ID_CONFIG, options.getGroupId());
+        Map<String, Object> configs = createConfigMapFromOptions(options);
+
+        LOG.info("Initiate reading kafka messages");
+
+        if (ObjectUtils.isEmpty(options.getReadStartTime())) {
+            consumerConfig.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, true);
+            return pipeline.apply("ReadFromKafka",
+                    KafkaIO.<String, String>read().withBootstrapServers(options.getBootstrapServers())
+                            .withTopic(options.getInputTopics()).withKeyDeserializer(StringDeserializer.class)
+                            .withValueDeserializer(StringDeserializer.class)
+                            .withConsumerFactoryFn(new ConsumerFactoryFn(configs))
+                            .withConsumerConfigUpdates(consumerConfig)
+                            .withoutMetadata());
+        } else {
+            Instant readStartTime = Instant.parse(options.getReadStartTime());
+            return pipeline.apply("ReadFromKafka",
+                    KafkaIO.<String, String>read().withBootstrapServers(options.getBootstrapServers())
+                            .withTopic(options.getInputTopics()).withKeyDeserializer(StringDeserializer.class)
+                            .withValueDeserializer(StringDeserializer.class)
+                            .withConsumerFactoryFn(new ConsumerFactoryFn(configs))
+                            .withConsumerConfigUpdates(consumerConfig)
+                            .withStartReadTime(readStartTime)
+                            .withoutMetadata());
+        }
+
+    }
+
+    /**
+     * This method sets some more configurations for our Consumer in order to read kafka messages.
+     *
+     * @param options The options required to run pipeline.
+     * @return A Map.
+     */
+    private Map<String, Object> createConfigMapFromOptions(CustomPipelineOptions options) {
+        Map<String, Object> configs = new HashMap<>();
+        configs.put(CommonConstants.PROJECT_ID, options.getProject());
+        configs.put(CommonConstants.BUCKET_NAME, options.getBucketName());
+        configs.put(CommonConstants.TRUSTSTORE_LOCATION, options.getTrustStoreLocation());
+        configs.put(CommonConstants.LOCAL_TRUSTSTORE, options.getLocalTrustStore());
+        configs.put(CommonConstants.TRUSTSTORE_TYPE, options.getTrustStoreType());
+        configs.put(CommonConstants.SECURITY_PROTOCOL, options.getSecurityProtocol());
+        configs.put(CommonConstants.BOOTSTRAP_SERVER, options.getBootstrapServers());
+        configs.put(CommonConstants.TRUSTSTORE_PASS, options.getTruststorePassword());
+        configs.put(ConsumerConfig.GROUP_ID_CONFIG, options.getGroupId());
+        return configs;
+    }
+
+    /**
+     * This method is used to sink mutations in Cloud Spanner.
+     *
+     * @param spannerProjectId The Spanner Project Id provided in pipeline custom options.
+     * @param instanceId       The instance Id provided in pipeline custom options.
+     * @param databaseId       The database Id provided in pipeline custom options.
+     * @param tableName        The table name.
+     * @param mapMessages      PCollection of Map.
+     */
+    public void sinkSingleRowDataToSpanner(String spannerProjectId, String instanceId,
+                                           String databaseId, String tableName, PCollection<Map<String, String>> mapMessages) {
+
+        PCollectionTuple resultingMutations = mapMessages.apply(TRANSFORM_MAP_TO_MUTATION,
+                SingleRowToMutationTransform.builder()
+                        .tableName(ValueProvider.StaticValueProvider.of(tableName))
+                        .successTag(SUCCESS_MAP_TO_MUTATION).failureTag(FAILURE_MAP_TO_SINK).build());
+
+        try {
+            resultingMutations.get(SUCCESS_MAP_TO_MUTATION).apply("WriteSuccessfulToSpanner",
+                    SpannerIO.write().withInstanceId(instanceId).withDatabaseId(databaseId)
+                            .withProjectId(spannerProjectId));
+        } catch (Exception ex) {
+            LOG.error(SPANNER_WRITE_OPERATION_FAILED, ex);
+        }
+    }
+
+    /**
+     * This method takes each mutation one by one and write it to the spanner
+     *
+     * @param projectId  The Project Id provided in pipeline custom options.
+     * @param instanceId The instance Id provided in pipeline custom options.
+     * @param databaseId The database Id provided in pipeline custom options.
+     * @param mutations  PCollection of mutations.
+     */
+    public void sinkMutationsAsGroup(String projectId, String instanceId, String databaseId,
+                                     PCollection<Mutation>... mutations) {
+
+        Arrays.asList(mutations).stream().forEach(mutation -> {
+            try {
+                mutation.apply(
+                        SpannerIO.write().withInstanceId(instanceId).withDatabaseId(databaseId)
+                                .withProjectId(projectId));
+                LOG.info("sinkMutationsAsGroup completed");
+            } catch (Exception ex) {
+                LOG.info("exception sinkMutationsAsGroup {}", ex.toString());
+                LOG.error(SPANNER_WRITE_OPERATION_FAILED, ex);
+            }
+        });
+    }
+
+
+    /**
+     * This method returns PCollection of Mutation to be stored in spanner.
+     *
+     * @param tableName   The table name.
+     * @param mapMessages PCollection of Map.
+     * @return PCollection of Mutation.
+     */
+    public PCollection<Mutation> getSingleRowMutation(String spannerProjectId, String instanceId,
+                                                      String databaseId, String tableName, PCollection<Map<String, String>> mapMessages) {
+
+        LOG.info("inside getSingleRowMutation of abstract pipeline {}", tableName);
+        PCollectionTuple resultingMutations = mapMessages.apply("TransformMapToMutation",
+                SingleRowToMutationTransform.builder()
+                        .tableName(ValueProvider.StaticValueProvider.of(tableName))
+                        .successTag(SUCCESS_MAP_TO_MUTATION).failureTag(FAILURE_MAP_TO_SINK).build());
+
+        return resultingMutations.get(SUCCESS_MAP_TO_MUTATION);
+    }
+
+    /**
+     * This method returns PCollection of Mutation to be stored in spanner.
+     *
+     * @param tableName   The table name.
+     * @param mapMessages PCollection of Map.
+     * @return PCollection of Mutation.
+     */
+    public PCollection<Mutation> getMultiRowMutation(String tableName,
+                                                     PCollection<List<Map<String, String>>> mapMessages) {
+        PCollectionTuple resultingMutations = mapMessages.apply(TRANSFORM_MAP_TO_MUTATION,
+                MultiRowToMutationTransform.builder()
+                        .tableName(ValueProvider.StaticValueProvider.of(tableName))
+                        .successTag(SUCCESS_MAP_TO_MUTATION).failureTag(FAILURE_MAP_TO_SINK).build());
+
+        return resultingMutations.get(SUCCESS_MAP_TO_MUTATION);
+    }
+
+    public void writeMutationsToSpanner(PipelineOptions originalOptions, PCollection<Mutation> productMutation) {
+        LOG.info("inside writeMutationsToSpanner of abstract pipeline " + originalOptions);
+        CustomPipelineOptions options =
+                originalOptions.as(CustomPipelineOptions.class);
+        sinkMutationsAsGroup(options.getSpannerProjectId(), options.getInstanceId(), options.getDatabaseId(), productMutation);
+    }
+
+    /**
+     * This method is used to set configurations for our Kafka consumer.
+     */
+    private static class ConsumerFactoryFn
+            implements SerializableFunction<Map<String, Object>, Consumer<byte[], byte[]>> {
+
+        private Map<String, Object> configs;
+
+        ConsumerFactoryFn(Map<String, Object> configs) {
+            this.configs = configs;
+        }
+
+        public Consumer<byte[], byte[]> apply(Map<String, Object> config) {
+            Map<String, Object> consumerConfig = new HashMap<>();
+            String localStore = ((String) this.configs.get(CommonConstants.LOCAL_TRUSTSTORE));
+            ;
+            moveTrustStoreToLocal(localStore);
+            consumerConfig.put(CommonConstants.SECURITY_DOT_PROTOCOL,
+                    this.configs.get(CommonConstants.SECURITY_PROTOCOL));
+            consumerConfig.put(SslConfigs.SSL_TRUSTSTORE_TYPE_CONFIG,
+                    this.configs.get(CommonConstants.TRUSTSTORE_TYPE));
+            consumerConfig.put(SslConfigs.SSL_TRUSTSTORE_LOCATION_CONFIG, localStore);
+            consumerConfig.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG,
+                    this.configs.get(CommonConstants.BOOTSTRAP_SERVER));
+            consumerConfig.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, ByteArrayDeserializer.class);
+            consumerConfig.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, ByteArrayDeserializer.class);
+            consumerConfig.put(SslConfigs.SSL_TRUSTSTORE_PASSWORD_CONFIG,
+                    this.configs.get(CommonConstants.TRUSTSTORE_PASS));
+            consumerConfig.put(ConsumerConfig.GROUP_ID_CONFIG, this.configs.get(ConsumerConfig.GROUP_ID_CONFIG));
+            return new KafkaConsumer<byte[], byte[]>(consumerConfig);
+        }
+
+        /**
+         * This method is used to store kafka.client.truststore to our local file
+         * whose path is given in the pipeline options.
+         *
+         * @param localStore The localStore.
+         */
+        private void moveTrustStoreToLocal(String localStore) {
+            try {
+                Storage storage = StorageOptions.newBuilder()
+                        .setProjectId((String) this.configs.get(CommonConstants.PROJECT_ID))
+                        .setCredentials(GoogleCredentials.getApplicationDefault()).build().getService();
+                Blob blob = storage.get((String) this.configs.get(CommonConstants.BUCKET_NAME),
+                        (String) this.configs.get(CommonConstants.TRUSTSTORE_LOCATION));
+                ReadChannel readChannel = blob.reader();
+                FileOutputStream fileOuputStream;
+                fileOuputStream = new FileOutputStream(localStore); // path to store
+                fileOuputStream.getChannel().transferFrom(readChannel, 0, Long.MAX_VALUE);
+                fileOuputStream.close();
+                File localStoreCheck = new File(localStore); // assuring the store file exists
+                if (localStoreCheck.exists()) {
+                    LOG.debug("Kafka client truststore key exists");
+                } else {
+                    LOG.error("Kafka client truststore does not key exists");
+                }
+            } catch (FileNotFoundException e) {
+                LOG.error("File not found " + e.getMessage());
+            } catch (IOException e) {
+                LOG.error("IO Exception" + e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * This is the interface which uses DataflowPipelineOptions to create custom options
+     * that can be used to configure the DataflowRunner.
+     * This defines the getters and setters for the custom arguments we pass for the Pipelines.
+     */
+    public interface CustomPipelineOptions extends DataflowPipelineOptions {
+
+        @Description("Kafka Bootstrap Servers")
+        @Validation.Required
+        String getBootstrapServers();
+
+        void setBootstrapServers(String bootstrapServers);
+
+        @Description("Kafka topic(s) to read the input from")
+        @Validation.Required
+        String getInputTopics();
+
+        void setInputTopics(String inputTopics);
+
+        @Description("The dead-letter table to output to within Spanner in"
+                + "format. If it doesn't exist, it will be created during pipeline execution.")
+        String getOutputDeadletterTable();
+
+        void setOutputDeadletterTable(String outputDeadletterTable);
+
+        @Description("Spanner instance ID to write to")
+        @Validation.Required
+        String getInstanceId();
+
+        void setInstanceId(String instanceId);
+
+        @Description("Spanner database name to write to")
+        @Validation.Required
+        String getDatabaseId();
+
+        void setDatabaseId(String databaseId);
+
+        @Description("Project id of spanner instance.")
+        @Validation.Required
+        String getSpannerProjectId();
+
+        void setSpannerProjectId(String spannerProjectId);
+
+        @Description("Project id of pubSub topic.")
+        @Validation.Required
+        String getPubSubProjectId();
+
+        void setPubSubProjectId(String pubSubProjectId);
+
+        @Description("Enterprise PubSub Create Product topic name")
+        String getEntPubSubCreateProductTopic();
+
+        void setEntPubSubCreateProductTopic(String entPubSubCreateProductTopic);
+
+        @Description("Enterprise PubSub Update Product topic name")
+        String getEntPubSubUpdateProductTopic();
+
+        void setEntPubSubUpdateProductTopic(String entPubSubUpdateProductTopic);
+
+        @Description("Enterprise PubSub Create Product version topic name")
+        String getEntPubSubCreateProductVersionTopic();
+
+        void setEntPubSubCreateProductVersionTopic(String entPubSubCreateProductVersionTopic);
+
+        @Description("Enterprise PubSub Update Product topic name")
+        String getEntPubSubUpdateProductVersionTopic();
+
+        void setEntPubSubUpdateProductVersionTopic(String entPubSubUpdateProductVersionTopic);
+
+        @Description("Group Id for Consumer Config")
+        @Validation.Required
+        String getGroupId();
+
+        void setGroupId(String groupId);
+
+        @Description("Read start time")
+        String getReadStartTime();
+
+        void setReadStartTime(String readStartTime);
+
+        @Description("Kafka Client Security Protocol")
+        @Validation.Required
+        String getSecurityProtocol();
+
+        void setSecurityProtocol(String securityProtocol);
+
+        @Description("Kafka Client SSL TrustStore Location")
+        String getTrustStoreLocation();
+
+        void setTrustStoreLocation(String trustStoreLocation);
+
+        @Description("Kafka Client SSL TrustStore Type")
+        String getTrustStoreType();
+
+        void setTrustStoreType(String trustStoreType);
+
+        @Description("GCP Storage name")
+        String getBucketName();
+
+        void setBucketName(String bucketName);
+
+        @Description("Local TrustStore")
+        String getLocalTrustStore();
+
+        void setlocalTrustStore(String localTrustStore);
+
+        @Description("truststore password")
+        String getTruststorePassword();
+
+        void setTruststorePassword(String truststorePassword);
+
+    }
+}
