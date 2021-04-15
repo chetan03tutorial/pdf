@@ -1,0 +1,75 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  annotations:
+    strategy.spinnaker.io/recreate: 'true'
+  name: {{ include "api.fullname" . }}
+  namespace: {{ .Values.namespace }}
+  labels:
+{{ include "api.labels" . | indent 4 }}
+{{- $id := .Values.projectId }}
+
+spec:
+  manualSelector: true
+  ttlSecondsAfterFinished: {{ .Values.purgeJob }}
+  selector:
+    matchLabels:
+      app: {{ include "api.name" . }}
+  template:
+    metadata:
+      annotations:
+        sidecar.istio.io/inject: "false"
+      labels:
+        app: {{ include "api.name" . }}
+    spec:
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      restartPolicy: Never
+      {{- if .Values.image.pullSecret }}
+      imagePullSecrets:
+        - name: {{ .Values.image.pullSecret }}
+      {{- end }}
+      {{- with .Values.dafaflowLifeCycle }}
+      initContainers:
+        - name: {{ .name }}
+          image: {{ .image | replace "projectId" $id }}
+          resources:
+            limits:
+              cpu: 800m
+              memory: 2Gi
+            requests:
+              cpu: 200m
+              memory: 200Mi
+          env:
+            - name: PROJECT_NAME
+              value: {{ $id | quote }}
+            - name: REGION
+              value: {{ .region | quote }}
+            - name: JOB_NAME
+              value: {{ .jobName | quote }}
+            - name: COMMAND
+              value: {{ .command | quote }}
+            - name: WAIT_TIME_TO_DRAIN
+              value: {{ .waitTimeInSeconds | quote }}
+      {{- end }}
+      containers:
+        - name: {{ .Chart.Name }}
+          image: {{ .Values.image.repository | replace "projectId" $id }}:{{ .Values.image.tag }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: TRUST_STORE_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Chart.Name }}
+                  key: truststore_pass
+          resources:
+            limits:
+              cpu: 800m
+              memory: 2Gi
+            requests:
+              cpu: 200m
+              memory: 200Mi
+          args:
+            {{-  range .Values.arguments }}
+            - {{ . | replace "projectId" $id }}
+            {{ end }}
