@@ -1,0 +1,174 @@
+package com.lbg.epscw.product.pipeline;
+
+import com.google.cloud.spanner.Mutation;
+import com.lbg.epscw.product.model.ProductsCatalogue;
+import com.lbg.epscw.product.transform.productcatalogue.ProductsCatalogueMsgToProtoTransform;
+import com.lbg.epscw.product.transform.productcatalogue.ProductsCatalogueProtoToMapTransform;
+import com.lbg.epscw.product.util.FailsafeElement;
+import epscw_api.v1.products.EpscwApiV1ProductCatalogue;
+import org.apache.beam.sdk.io.gcp.pubsub.PubsubIO;
+import org.apache.beam.sdk.options.PipelineOptions;
+import org.apache.beam.sdk.options.PipelineOptionsFactory;
+import org.apache.beam.sdk.transforms.MapElements;
+import org.apache.beam.sdk.transforms.PTransform;
+import org.apache.beam.sdk.transforms.SimpleFunction;
+import org.apache.beam.sdk.values.KV;
+import org.apache.beam.sdk.values.PCollection;
+import org.apache.beam.sdk.values.PCollectionTuple;
+import org.apache.beam.sdk.values.TupleTag;
+
+import java.io.Serializable;
+import java.text.MessageFormat;
+import java.util.Map;
+
+/**
+ * that can read data from Vault Kafka and write to Spanner.
+ * This class is responsible to execute various Transforms in order to read data from Vault Kafka and
+ * write to Spanner and publish to PubSub.
+ */
+public class ProductsCatalogueToSpannerPipeline extends AbstractKafkaToSinkPipeline
+    implements Serializable {
+
+    private static final String ENT_TOPIC_NAME = "projects/{0}/topics/{1}";
+    EpscwApiV1ProductCatalogue.OperationType operationType;
+
+    public static final TupleTag<ProductsCatalogue> KAFKA_TO_PROTO_SUCCESS_TAG =
+        new TupleTag<ProductsCatalogue>() {
+        };
+
+    public static final TupleTag<FailsafeElement<ProductsCatalogue, ProductsCatalogue>>
+        PROTO_TO_MAP_FAILURE_TAG = new TupleTag<FailsafeElement<ProductsCatalogue, ProductsCatalogue>>() {
+    };
+
+    /**
+     * This is the main method of this class.
+     * The interface "CustomPipelineOptions" is registered using PipelineOptionsFactory.
+     * PipelineOptionsFactory validates that the custom options are compatible with all other registered options.
+     * @param args
+     */
+    public static void main(String[] args) {
+        PipelineOptionsFactory.register(CustomPipelineOptions.class);
+
+        CustomPipelineOptions options =
+            PipelineOptionsFactory.fromArgs(args).withValidation().as(CustomPipelineOptions.class);
+
+        ProductsCatalogueToSpannerPipeline pipeline = new ProductsCatalogueToSpannerPipeline();
+        pipeline.run(options);
+    }
+
+    /**
+     * This method initiates the transformations to be applied on kafka messages received.
+     * @param kafkaMessages The kafka messages in key-value form.
+     * @param options       The options required to run pipeline.
+     */
+    @Override
+    public void initiateTransformations(PCollection<KV<String, String>> kafkaMessages,
+        CustomPipelineOptions options) {
+
+        // STEP:1 -> Building a Pipeline transform (ProductsCatalogueMsgToProtoTransform) which contains a
+        // PCollection of Tuples with following success and failure tags.
+        ProductsCatalogueMsgToProtoTransform productsCatalogueMsgToProtoTransform =
+                ProductsCatalogueMsgToProtoTransform.builder().successTag(KAFKA_TO_PROTO_SUCCESS_TAG)
+                        .failureTag(KAFKA_TO_PROTO_FAILURE_TAG).build();
+
+        LOG.info("Initiating Kafka message to proto transform");
+        //Step:2 -> Using the above transform to convert kafka messages to a protobuf.
+        PCollectionTuple protoObject = parseMsgToProto("KafkaMsgToProtoTransform", kafkaMessages,
+                productsCatalogueMsgToProtoTransform);
+
+        LOG.info("Kafka message to proto transform completed. Now, converting Postings Batch Proto object to Map");
+
+        // STEP:3 -> Building a Pipeline transform (ProductsCatalogueProtoToMapTransform) which contains a
+        // PCollection of Tuples with following success and failure tags.
+        ProductsCatalogueProtoToMapTransform productsCatalogueProtoToMapTransformer =
+                ProductsCatalogueProtoToMapTransform.builder().successTag(PROTO_TO_MAP_SUCCESS_TAG)
+                        .failureTag(PROTO_TO_MAP_FAILURE_TAG).build();
+
+        // STEP:4 -> Using the above transform to convert proto to Map of Model-ProductsCatalogue.
+        PCollectionTuple productsCatalogue = parseProtoToMap("ProtoToAccountMapTransform",
+                protoObject.get(KAFKA_TO_PROTO_SUCCESS_TAG), productsCatalogueProtoToMapTransformer);
+
+        LOG.info("Product Catalogue Proto object to Map transform completed. Now, initiating mutations for PostingsBatch");
+
+        // STEP:5 -> Converting the Map of Model-ProductsCatalogue to Mutations.
+        LOG.info("Calling SingleRowMutation for ProductsCatalogue");
+        PCollection<Mutation> productsCatalogueMutation =
+                getSingleRowMutation("Product", options, productsCatalogue.get(PROTO_TO_MAP_SUCCESS_TAG));
+
+        LOG.info("Mutations for Products Catalogue completed. Now, converting Products Catalogue Proto object to Map");
+
+        // All transformations completed, sink it to Spanner
+        writeMutationsToSpanner(options, productsCatalogueMutation);
+
+        LOG.info("ProductsCatalogue to spanner write operation completed. Now, publish Proto to PubSub");
+
+        ProductsCatalogueToSpannerPipeline.CustomPipelineOptions option =
+                options.as(ProductsCatalogueToSpannerPipeline.CustomPipelineOptions.class);
+
+        LOG.info("protoObject complete {}", protoObject);
+        LOG.info("protoMap complete {}", productsCatalogue);
+
+        // STEP:10 -> Now, finally publish proto object to PubSub.
+        publishEnterpriseProtoToPubSub(option, protoObject);
+
+        LOG.info("Proto published to PubSub");
+    }
+
+    public PCollection<Mutation> getSingleRowMutation(String tableName,
+                                                      PipelineOptions originalOptions, PCollection<Map<String, String>> mapMessages) {
+        LOG.info("inside getSingleRowMutation of original pipeline");
+        CustomPipelineOptions options =
+                originalOptions.as(CustomPipelineOptions.class);
+
+        return getSingleRowMutation(options.getSpannerProjectId(), options.getInstanceId(),
+                options.getDatabaseId(), tableName, mapMessages);
+    }
+
+    /**
+     * This method is used to publish Proto to PubSub.
+     * @param options     The options required to run pipeline.
+     * @param protoObject The proto object to be published on PubSub.
+     */
+    private void publishEnterpriseProtoToPubSub(CustomPipelineOptions options,
+                                                PCollectionTuple protoObject) {
+        ProductsCatalogueToSpannerPipeline.CustomPipelineOptions pubSubOptions =
+                options.as(ProductsCatalogueToSpannerPipeline.CustomPipelineOptions.class);
+
+        LOG.info("inside enterprise");
+        protoObject.get(KAFKA_TO_PROTO_SUCCESS_TAG).apply(MapElements.via(
+                new SimpleFunction<ProductsCatalogue, EpscwApiV1ProductCatalogue.ProductEvent>() {
+                    @Override
+                    public EpscwApiV1ProductCatalogue.ProductEvent apply(
+                            ProductsCatalogue input) {
+                        return input.getEnterpriseCreateProductEvent();
+                    }
+                })).apply("PublishEnterpriseProtoToPubSub",
+                PubsubIO.writeProtos(EpscwApiV1ProductCatalogue.ProductEvent.class)
+                        .to(MessageFormat.format(ENT_TOPIC_NAME, pubSubOptions.getPubSubProjectId(),
+                                pubSubOptions.getEntPubSubCreateProductTopic())));
+
+        protoObject.get(KAFKA_TO_PROTO_SUCCESS_TAG).apply(MapElements.via(
+                new SimpleFunction<ProductsCatalogue, EpscwApiV1ProductCatalogue.ProductEvent>() {
+                    @Override
+                    public EpscwApiV1ProductCatalogue.ProductEvent apply(
+                            ProductsCatalogue input) {
+                        return input.getEnterpriseUpdateProductEvent();
+                    }
+                })).apply("PublishEnterpriseProtoToPubSub",
+                PubsubIO.writeProtos(EpscwApiV1ProductCatalogue.ProductEvent.class)
+                        .to(MessageFormat.format(ENT_TOPIC_NAME, pubSubOptions.getPubSubProjectId(),
+                                pubSubOptions.getEntPubSubUpdateProductTopic())));
+    }
+
+    /**
+     * This method transforms proto into ProductsCatalogue Map.
+     * @param stepName         The name of the step to be executed.
+     * @param productsCatalogue    PCollection of productsCatalogue.
+     * @param protoTransformer Transformer to convert proto to Map.
+     * @return                 PCollectionTuple
+     */
+    private PCollectionTuple parseProtoToMap(String stepName, PCollection<ProductsCatalogue> productsCatalogue,
+        PTransform<PCollection<ProductsCatalogue>, PCollectionTuple> protoTransformer) {
+        return productsCatalogue.apply(stepName, protoTransformer);
+    }
+}
