@@ -1,0 +1,87 @@
+package com.lbg.epscw.product.coders;
+
+import com.lbg.epscw.product.util.FailsafeElement;
+import org.apache.beam.sdk.coders.*;
+import org.apache.beam.sdk.values.TypeDescriptor;
+import org.apache.beam.sdk.values.TypeParameter;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.util.Arrays;
+import java.util.List;
+
+/**
+ * The {@link FailsafeElementCoder} encodes and decodes {@link FailsafeElement} objects.
+ *
+ * <p>This coder is necessary until Avro supports parameterized types (<a
+ * href="https://issues.apache.org/jira/browse/AVRO-1571">AVRO-1571</a>) without requiring to
+ * explicitly specifying the schema for the type.
+ *
+ * @param <O> The type of the original payload to be encoded.
+ * @param <C> The type of the current payload to be encoded.
+ */
+public class FailsafeElementCoder<O, C>
+    extends CustomCoder<FailsafeElement<O, C>> {
+
+  private static final NullableCoder<String> STRING_CODER = NullableCoder.of(StringUtf8Coder.of());
+  private final Coder<O> originalPayloadCoder;
+  private final Coder<C> currentPayloadCoder;
+
+  private FailsafeElementCoder(
+      Coder<O> originalPayloadCoder, Coder<C> currentPayloadCoder) {
+    this.originalPayloadCoder = originalPayloadCoder;
+    this.currentPayloadCoder = currentPayloadCoder;
+  }
+
+  public static <O, C> FailsafeElementCoder<O, C> of(
+      Coder<O> originalPayloadCoder, Coder<C> currentPayloadCoder) {
+    return new FailsafeElementCoder<>(originalPayloadCoder, currentPayloadCoder);
+  }
+
+  public Coder<O> getOriginalPayloadCoder() {
+    return originalPayloadCoder;
+  }
+
+  public Coder<C> getCurrentPayloadCoder() {
+    return currentPayloadCoder;
+  }
+
+  @Override
+  public void encode(FailsafeElement<O, C> value, OutputStream outStream)
+      throws IOException {
+    if (value == null) {
+      throw new CoderException("The FailsafeElementCoder cannot encode a null object!");
+    }
+
+    originalPayloadCoder.encode(value.getOriginalPayload(), outStream);
+    currentPayloadCoder.encode(value.getPayload(), outStream);
+    STRING_CODER.encode(value.getErrorMessage(), outStream);
+    STRING_CODER.encode(value.getStacktrace(), outStream);
+  }
+
+  @Override
+  public FailsafeElement<O, C> decode(InputStream inStream) throws IOException {
+
+    O originalPayload = originalPayloadCoder.decode(inStream);
+    C currentPayload = currentPayloadCoder.decode(inStream);
+    String errorMessage = STRING_CODER.decode(inStream);
+    String stacktrace = STRING_CODER.decode(inStream);
+
+    return FailsafeElement.of(originalPayload, currentPayload)
+        .setErrorMessage(errorMessage)
+        .setStacktrace(stacktrace);
+  }
+
+  @Override
+  public List<? extends Coder<?>> getCoderArguments() {
+    return Arrays.asList(originalPayloadCoder, currentPayloadCoder);
+  }
+
+  @Override
+  public TypeDescriptor<FailsafeElement<O, C>> getEncodedTypeDescriptor() {
+    return new TypeDescriptor<FailsafeElement<O, C>>() {}.where(
+            new TypeParameter<O>() {}, originalPayloadCoder.getEncodedTypeDescriptor())
+        .where(new TypeParameter<C>() {}, currentPayloadCoder.getEncodedTypeDescriptor());
+  }
+}
