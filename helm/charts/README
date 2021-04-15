@@ -1,0 +1,12 @@
+### Helm Charts to do dataflow Job Deployment.
+
+- Every Job type will have different values for arg which will be set using separate values files for
+  example helm install --set-file ./jobs/accounts_account_events.yaml ./helm
+
+## Resources
+  - Deployment having dataflow pipeline container.
+  - Service Account to run dataflow job.
+
+## Deployment to Environments
+ deployment to different environments will be handled using helm-ovrerides for example
+  - deployment to integration environment will be done using ../helm-overrides/eplus-account-create-df.yaml
